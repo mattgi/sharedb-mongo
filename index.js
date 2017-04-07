@@ -1291,7 +1291,15 @@ var collectionOperationsMap = {
     collection.distinct(value.field, query, cb);
   },
   '$aggregate': function(collection, query, value, cb) {
-    collection.aggregate(value, cb);
+    var options = {}
+
+    if (process.env.MONGO_SECONDARY_ONLY) {
+      options.readPreference = 'secondary';
+    } else {
+      options.readPreference = 'secondaryPreferred';
+    }
+
+    collection.aggregate(value, options, cb);
   },
   '$mapReduce': function(collection, query, value, cb) {
     if (typeof value !== 'object') {
