@@ -118,6 +118,14 @@ ShareDbMongo.prototype._flushPendingConnect = function() {
   }
 };
 
+ShareDbMongo.prototype._mongodbOptions = function(options) {
+  if(options instanceof Object) {
+    return Object.assign(Object.assign({}, options), { useNewUrlParser: false })
+  } else {
+    return  { useNewUrlParser: false };
+  }
+}
+
 ShareDbMongo.prototype._connect = function(mongo, options) {
   // Create the mongo connection client connections if needed
   //
@@ -131,24 +139,24 @@ ShareDbMongo.prototype._connect = function(mongo, options) {
     } else {
       tasks = {
         mongo: function(parallelCb) {
-          mongodb.connect(mongo, options.mongoOptions, parallelCb);
+          mongodb.connect(mongo, self._mongodbOptions(options.mongoOptions), parallelCb);
         },
         mongoPoll: function(parallelCb) {
-          mongodb.connect(options.mongoPoll, options.mongoPollOptions, parallelCb);
+          mongodb.connect(options.mongoPoll, self._mongodbOptions(options.mongoPollOptions), parallelCb);
         }
       };
     }
     async.parallel(tasks, function(err, results) {
       if (err) throw err;
-      self.mongo = results.mongo;
-      self.mongoPoll = results.mongoPoll;
+      self.mongo = results.mongo.db();
+      self.mongoPoll = results.mongoPoll.db();
       self._flushPendingConnect();
     });
     return;
   }
-  var finish = function(err, db) {
+  var finish = function(err, client) {
     if (err) throw err;
-    self.mongo = db;
+    self.mongo = client.db();
     self._flushPendingConnect();
   };
   if (typeof mongo === 'function') {
@@ -172,7 +180,7 @@ ShareDbMongo.prototype._connect = function(mongo, options) {
     delete mongoOptions.allowJSQueries;
     delete mongoOptions.allowAggregateQueries;
   }
-  mongodb.connect(mongo, mongoOptions, finish);
+  mongodb.connect(mongo, self._mongodbOptions(mongoOptions), finish);
 };
 
 ShareDbMongo.prototype.close = function(callback) {
@@ -653,14 +661,21 @@ ShareDbMongo.prototype._query = function(collection, inputQuery, projection, cal
       function(err, extra) {
         if (err) return callback(err);
         callback(null, [], extra);
-      }
+      },
+      parsed.readPreference
     );
     return;
   }
 
   // No collection operations were used. Create an initial cursor for
   // the query, that can be transformed later.
-  var cursor = collection.find(parsed.query).project(projection);
+  var options = {}
+
+  if (parsed.readPreference) {
+    options.readPreference = parsed.readPreference
+  }
+
+  var cursor = collection.find(parsed.query, options).project(projection);
 
   // Cursor transforms such as $skip transform the cursor into a new
   // one. If multiple transforms are specified on inputQuery, they all
@@ -1010,6 +1025,7 @@ function parseQuery(inputQuery) {
   var cursorTransforms = {};
   var cursorOperationKey = null;
   var cursorOperationValue = null;
+  var readPreference = null
 
   if (inputQuery.$query) {
     throw new Error("unexpected $query: should have called checkQuery");
@@ -1023,6 +1039,8 @@ function parseQuery(inputQuery) {
       } else if (cursorOperationsMap[key]) {
         cursorOperationKey = key;
         cursorOperationValue = inputQuery[key];
+      } else if (key === '$readPreference') {
+        readPreference = inputQuery[key];
       } else {
         query[key] = inputQuery[key];
       }
@@ -1035,7 +1053,8 @@ function parseQuery(inputQuery) {
     collectionOperationValue,
     cursorTransforms,
     cursorOperationKey,
-    cursorOperationValue
+    cursorOperationValue,
+    readPreference
   );
 };
 ShareDbMongo._parseQuery = parseQuery; // for tests
@@ -1290,8 +1309,17 @@ var collectionOperationsMap = {
   '$distinct': function(collection, query, value, cb) {
     collection.distinct(value.field, query, cb);
   },
-  '$aggregate': function(collection, query, value, cb) {
-    collection.aggregate(value, cb);
+  '$aggregate': function(collection, query, value, cb, readPreference) {
+    var options = {}
+
+    collection.aggregate(value, options, function(err, cursor) {
+      if(err) return cb(err);
+
+      cursor.toArray(function (err, res) {
+        if(err) return cb(err);
+        return cb(null, res);
+      });
+    });
   },
   '$mapReduce': function(collection, query, value, cb) {
     if (typeof value !== 'object') {
